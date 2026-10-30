@@ -103,14 +103,15 @@ def create_progress_bar(
     is_paused: bool = False,
 ) -> str:
     """
-    Creates a modern Discord progress bar string with timestamps and status icon.
-    Example: ▶️ `01:23` ━━━━🔘─────────── `03:45`
+    Creates a modern Discord progress bar string with timestamps, status icon, and percentage.
+    Example: ▶️ `01:23` ━━━━🔘─────────── `03:45` • **38%**
     """
     pos_str = format_time(position_ms)
     dur_str = format_time(duration_ms)
 
     ratio = (position_ms / duration_ms) if duration_ms > 0 else 0.0
     ratio = max(0.0, min(1.0, ratio))
+    pct = int(ratio * 100)
 
     knob_idx = min(length - 1, int(ratio * length))
     filled = "━" * knob_idx
@@ -118,7 +119,9 @@ def create_progress_bar(
     bar = f"{filled}🔘{empty}"
 
     status_icon = "⏸️" if is_paused else "▶️"
-    return f"{status_icon} `{pos_str}` {bar} `{dur_str}`"
+    if duration_ms <= 0:
+        return f"{status_icon} `{pos_str}` {bar} `{dur_str}`"
+    return f"{status_icon} `{pos_str}` {bar} `{dur_str}` • **{pct}%**"
 
 
 async def download_cover_art_bounded(
@@ -157,12 +160,12 @@ async def download_cover_art_bounded(
 
 def _render_cover_sync(cover_bytes: bytes | None) -> io.BytesIO:
     """
-    Renders pure, high-resolution album cover art in-memory.
-    No progress bar, title, EQ, or platform text is baked into the image.
+    Renders pure, minimalist album cover art in-memory (300x300 px).
+    Designed to serve as a clean, high-resolution Discord Embed thumbnail on the right side.
     Strictly closes all Pillow Image objects to prevent memory leaks.
     """
-    size = 600
-    radius = 28
+    size = 300
+    radius = 24
     canvas: Image.Image | None = None
     draw: ImageDraw.ImageDraw | None = None
     cover_img: Image.Image | None = None
@@ -190,7 +193,7 @@ def _render_cover_sync(cover_bytes: bytes | None) -> io.BytesIO:
 
             # Draw sleek concentric grooves
             center = size // 2
-            for r in range(90, 270, 20):
+            for r in range(40, 115, 10):
                 c_draw.ellipse(
                     [center - r, center - r, center + r, center + r],
                     outline=(32, 38, 58, 255),
@@ -199,14 +202,14 @@ def _render_cover_sync(cover_bytes: bytes | None) -> io.BytesIO:
 
             # Center vinyl label with brand indigo gradient fill
             c_draw.ellipse(
-                [center - 70, center - 70, center + 70, center + 70],
+                [center - 32, center - 32, center + 32, center + 32],
                 fill=(88, 101, 242, 255),
                 outline=(129, 140, 248, 255),
-                width=3,
+                width=2,
             )
             # Center spindle hole
             c_draw.ellipse(
-                [center - 16, center - 16, center + 16, center + 16],
+                [center - 8, center - 8, center + 8, center + 8],
                 fill=(12, 14, 22, 255),
             )
 

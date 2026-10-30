@@ -87,3 +87,37 @@ def test_format_time() -> None:
     assert format_time(0) == "00:00"
     assert format_time(65000) == "01:05"
     assert format_time(3665000) == "1:01:05"
+
+
+def test_seek_select_generation() -> None:
+    from unittest.mock import MagicMock
+    from ui.views import SeekSelect
+
+    mock_player = MagicMock()
+    mock_track = MagicMock()
+    mock_track.length = 200000  # 200s
+    mock_player.current = mock_track
+    mock_player.position = 50000  # 50s (25%)
+    mock_player.paused = False
+
+    seek_select = SeekSelect(mock_player)
+    assert len(seek_select.options) > 5
+    assert "25%" in seek_select.placeholder
+    assert any(opt.value == "0" for opt in seek_select.options)
+    assert any(opt.value == "custom" for opt in seek_select.options)
+
+
+def test_seek_select_zero_duration() -> None:
+    from unittest.mock import MagicMock
+    from ui.views import SeekSelect
+
+    mock_player = MagicMock()
+    mock_track = MagicMock()
+    mock_track.length = 0
+    mock_player.current = mock_track
+    mock_player.position = 0
+    mock_player.paused = False
+
+    seek_select = SeekSelect(mock_player)
+    assert len(seek_select.options) == 1
+    assert seek_select.options[0].value == "custom"

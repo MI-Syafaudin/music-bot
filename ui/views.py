@@ -17,6 +17,7 @@ from audio.dsp import (
     create_filters_from_5_bands,
 )
 from database.models import CustomEQPreset
+from ui.card import format_time
 from utils.logging import LOGGER
 from utils.permissions import can_bypass_vote_skip, calculate_vote_quorum
 from utils.security import sanitize_gain, sanitize_seek_timestamp, SecurityValidationError
@@ -51,9 +52,11 @@ class SeekModal(discord.ui.Modal, title="Seek ke Waktu Lagu"):
         try:
             target_ms = sanitize_seek_timestamp(time_str, player.current.length)
             await player.seek(target_ms)
+            if hasattr(player, "now_playing_view") and player.now_playing_view:
+                player.now_playing_view.sync_view_states()
             if player.now_playing_message:
                 embed = player.build_now_playing_embed()
-                await player.now_playing_message.edit(embed=embed)
+                await player.now_playing_message.edit(embed=embed, view=getattr(player, "now_playing_view", None))
         except Exception as e:
             LOGGER.error("Error seeking via modal: %s", e)
 
@@ -210,6 +213,99 @@ class EQSelectView(discord.ui.View):
         await interaction.response.send_modal(CustomEQModal(player))
 
 
+class SeekSelect(discord.ui.Select):
+    """
+    Interactive seek dropdown slider allowing users to jump directly to percentages or timestamps.
+    Dynamically updates its placeholder and options as the song progresses.
+    """
+
+    def __init__(self, player: MusicPlayer) -> None:
+        self._player_ref = weakref.ref(player)
+        super().__init__(
+            placeholder=self._build_placeholder(player),
+            min_values=1,
+            max_values=1,
+            options=self._build_options(player),
+            row=0,
+        )
+
+    def _build_placeholder(self, player: MusicPlayer | None) -> str:
+        if not player or not player.current or player.current.length <= 0:
+            return "📍 Geser Posisi Lagu (Seek Slider)..."
+        pos = player.position
+        dur = player.current.length
+        ratio = max(0.0, min(1.0, pos / dur))
+        pct = int(ratio * 100)
+        icon = "⏸️" if player.paused else "▶️"
+        return f"📍 {icon} {format_time(pos)} / {format_time(dur)} ({pct}%) • Klik untuk Geser"
+
+    def _build_options(self, player: MusicPlayer | None) -> list[discord.SelectOption]:
+        if not player or not player.current or player.current.length <= 0:
+            return [
+                discord.SelectOption(
+                    label="Custom Timestamp (MM:SS)",
+                    value="custom",
+                    emoji="🎯",
+                    description="Input waktu spesifik secara manual",
+                )
+            ]
+
+        dur = player.current.length
+        milestones = [0, 15, 30, 50, 70, 85, 95]
+        options: list[discord.SelectOption] = []
+        for pct in milestones:
+            target_ms = int(dur * (pct / 100.0))
+            t_str = format_time(target_ms)
+            desc = "Awal lagu" if pct == 0 else ("Pertengahan lagu" if pct == 50 else f"Posisi {pct}% lagu")
+            emoji = "⏮️" if pct == 0 else ("▶️" if pct == 50 else "🔘")
+            options.append(
+                discord.SelectOption(
+                    label=f"{pct}% ({t_str})",
+                    value=str(target_ms),
+                    description=desc,
+                    emoji=emoji,
+                )
+            )
+
+        options.append(
+            discord.SelectOption(
+                label="Custom Timestamp...",
+                value="custom",
+                description="Buka modal dialog MM:SS / HH:MM:SS",
+                emoji="🎯",
+            )
+        )
+        return options
+
+    def sync_state(self, player: MusicPlayer | None) -> None:
+        """Syncs placeholder and options with current player position."""
+        self.placeholder = self._build_placeholder(player)
+        self.options = self._build_options(player)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        player = self._player_ref()
+        if not player or not player.current:
+            await interaction.response.defer()
+            return
+
+        choice = self.values[0]
+        if choice == "custom":
+            await interaction.response.send_modal(SeekModal(player))
+            return
+
+        try:
+            target_ms = int(choice)
+            await player.seek(target_ms)
+            view = self.view
+            if view and hasattr(view, "sync_view_states"):
+                view.sync_view_states()
+            embed = player.build_now_playing_embed()
+            await interaction.response.edit_message(embed=embed, view=view)
+        except Exception as e:
+            LOGGER.error("Error seeking via select: %s", e)
+            await interaction.response.defer()
+
+
 class NowPlayingView(discord.ui.View):
     """
     Main interactive control view for currently playing track.
@@ -220,17 +316,22 @@ class NowPlayingView(discord.ui.View):
     def __init__(self, player: MusicPlayer) -> None:
         super().__init__(timeout=None)
         self._player_ref = weakref.ref(player)
-        self._sync_button_states()
+        self.seek_select = SeekSelect(player)
+        self.add_item(self.seek_select)
+        self.sync_view_states()
 
     @property
     def player(self) -> MusicPlayer | None:
         return self._player_ref()
 
-    def _sync_button_states(self) -> None:
-        """Synchronizes button labels, styles, and emojis to player state."""
+    def sync_view_states(self) -> None:
+        """Synchronizes button labels, styles, emojis, and seek select state to player."""
         player = self.player
         if not player:
             return
+
+        # Synchronize seek select dropdown
+        self.seek_select.sync_state(player)
 
         # Play/Pause button state
         self.btn_play_pause.emoji = "▶️" if player.paused else "⏸️"
@@ -252,9 +353,13 @@ class NowPlayingView(discord.ui.View):
             discord.ButtonStyle.success if is_auto else discord.ButtonStyle.secondary
         )
 
-    # ---------------- Row 0: Basic Controls ----------------
+    def _sync_button_states(self) -> None:
+        """Backward compatibility alias."""
+        self.sync_view_states()
 
-    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, row=0)
+    # ---------------- Row 1: Playback & Fast Seek Controls ----------------
+
+    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, row=1)
     async def btn_previous(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player:
@@ -268,7 +373,20 @@ class NowPlayingView(discord.ui.View):
 
         await interaction.response.defer()
 
-    @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="-15s", emoji="⏪", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_rewind(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        player = self.player
+        if not player or not player.current:
+            await interaction.response.defer()
+            return
+
+        new_pos = max(0, player.position - 15000)
+        await player.seek(new_pos)
+        self.sync_view_states()
+        embed = player.build_now_playing_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.primary, row=1)
     async def btn_play_pause(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player or not player.current:
@@ -276,11 +394,24 @@ class NowPlayingView(discord.ui.View):
             return
 
         await player.pause(not player.paused)
-        self._sync_button_states()
+        self.sync_view_states()
         embed = player.build_now_playing_embed()
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="+15s", emoji="⏩", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_forward(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        player = self.player
+        if not player or not player.current:
+            await interaction.response.defer()
+            return
+
+        new_pos = min(player.current.length, player.position + 15000)
+        await player.seek(new_pos)
+        self.sync_view_states()
+        embed = player.build_now_playing_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=1)
     async def btn_skip(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player or not player.current or not interaction.guild:
@@ -307,7 +438,9 @@ class NowPlayingView(discord.ui.View):
 
         await interaction.response.defer()
 
-    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
+    # ---------------- Row 2: Secondary Controls ----------------
+
+    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=2)
     async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player:
@@ -327,7 +460,7 @@ class NowPlayingView(discord.ui.View):
         except Exception:
             await interaction.response.defer()
 
-    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, row=2)
     async def btn_shuffle(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player or player.queue.is_empty:
@@ -335,70 +468,9 @@ class NowPlayingView(discord.ui.View):
             return
 
         player.queue.shuffle()
+        self.sync_view_states()
         embed = player.build_now_playing_embed()
         await interaction.response.edit_message(embed=embed, view=self)
-
-    # ---------------- Row 1: Seek & Audio Controls ----------------
-
-    @discord.ui.button(label="-15s", emoji="⏪", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_rewind(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        player = self.player
-        if not player or not player.current:
-            await interaction.response.defer()
-            return
-
-        new_pos = max(0, player.position - 15000)
-        await player.seek(new_pos)
-        embed = player.build_now_playing_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label="+15s", emoji="⏩", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_forward(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        player = self.player
-        if not player or not player.current:
-            await interaction.response.defer()
-            return
-
-        new_pos = min(player.current.length, player.position + 15000)
-        await player.seek(new_pos)
-        embed = player.build_now_playing_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label="Seek", emoji="🎯", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_seek_modal(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        player = self.player
-        if not player or not player.current:
-            await interaction.response.defer()
-            return
-
-        await interaction.response.send_modal(SeekModal(player))
-
-    @discord.ui.button(label="Equalizer", emoji="🎛️", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_equalizer(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        player = self.player
-        if not player:
-            await interaction.response.defer()
-            return
-
-        await interaction.response.send_message(
-            "🎛️ **Pilih Preset Equalizer atau Bangun Custom EQ:**",
-            view=EQSelectView(player),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Lyrics", emoji="📜", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_lyrics(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        player = self.player
-        if not player or not player.current:
-            await interaction.response.defer()
-            return
-
-        from ui.lyrics_view import SyncedLyricsView
-        view = SyncedLyricsView(player)
-        initial_embed = await view.get_lyrics_embed()
-        await interaction.response.send_message(embed=initial_embed, view=view, ephemeral=True)
-
-    # ---------------- Row 2: Mode Toggles ----------------
 
     @discord.ui.button(label="Loop: Off", emoji="🔁", style=discord.ButtonStyle.secondary, row=2)
     async def btn_loop(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -410,7 +482,7 @@ class NowPlayingView(discord.ui.View):
         modes = ["off", "track", "queue"]
         next_mode = modes[(modes.index(player.loop_mode) + 1) % len(modes)]
         player.loop_mode = next_mode
-        self._sync_button_states()
+        self.sync_view_states()
         embed = player.build_now_playing_embed()
         await interaction.response.edit_message(embed=embed, view=self)
 
@@ -427,6 +499,42 @@ class NowPlayingView(discord.ui.View):
             else wavelink.AutoPlayMode.enabled
         )
         player.autoplay = new_state
-        self._sync_button_states()
+        self.sync_view_states()
         embed = player.build_now_playing_embed()
         await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="EQ", emoji="🎛️", style=discord.ButtonStyle.secondary, row=2)
+    async def btn_equalizer(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        player = self.player
+        if not player:
+            await interaction.response.defer()
+            return
+
+        await interaction.response.send_message(
+            "🎛️ **Pilih Preset Equalizer atau Bangun Custom EQ:**",
+            view=EQSelectView(player),
+            ephemeral=True,
+        )
+
+    # ---------------- Row 3: Utility Controls ----------------
+
+    @discord.ui.button(label="Lyrics", emoji="📜", style=discord.ButtonStyle.secondary, row=3)
+    async def btn_lyrics(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        player = self.player
+        if not player or not player.current:
+            await interaction.response.defer()
+            return
+
+        from ui.lyrics_view import SyncedLyricsView
+        view = SyncedLyricsView(player)
+        initial_embed = await view.get_lyrics_embed()
+        await interaction.response.send_message(embed=initial_embed, view=view, ephemeral=True)
+
+    @discord.ui.button(label="Seek", emoji="🎯", style=discord.ButtonStyle.secondary, row=3)
+    async def btn_seek_modal(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        player = self.player
+        if not player or not player.current:
+            await interaction.response.defer()
+            return
+
+        await interaction.response.send_modal(SeekModal(player))

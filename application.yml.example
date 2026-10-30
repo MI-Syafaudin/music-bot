@@ -72,9 +72,17 @@ plugins:
     allowDirectPlaylistIds: true
     clients:
       - MUSIC
-      - ANDROID_TESTSUITE
+      - ANDROID
       - WEB
       - TVHTML5EMBEDDED
+    # Catatan: Jika menggunakan IP VPS/Datacenter yang terkena pembatasan bot YouTube (429/Sign-in required),
+    # Anda dapat mengaktifkan opsi OAuth2 atau PO-Token di bawah ini:
+    # oauth:
+    #   enabled: true
+    #   skipInitialization: false
+    # potoken:
+    #   token: "YOUR_PO_TOKEN"
+    #   visitorData: "YOUR_VISITOR_DATA"
 
   # Konfigurasi LavaSrc Multi-Platform (Spotify, Apple Music, Deezer, Tidal)
   lavasrc:

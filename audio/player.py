@@ -39,6 +39,7 @@ class MusicPlayer(wavelink.Player):
         super().__init__(*args, **kwargs)
         self.text_channel: discord.TextChannel | None = None
         self.now_playing_message: discord.Message | None = None
+        self.now_playing_view: NowPlayingView | None = None
 
         self.vote_skips: set[int] = set()
         self.current_preset: str = "flat"
@@ -79,8 +80,8 @@ class MusicPlayer(wavelink.Player):
 
     def build_now_playing_embed(self) -> discord.Embed:
         """
-        Builds modern, sleek Discord Embed with separated real-time progress bar,
-        song title, platform badge, EQ preset, volume, loop, and queue metadata.
+        Builds modern, sleek Discord Embed with minimalist thumbnail cover on the top right,
+        song title & author beside the cover, and real-time interactive progress bar below.
         """
         if not self.current:
             return discord.Embed(
@@ -107,12 +108,14 @@ class MusicPlayer(wavelink.Player):
         progress_str = create_progress_bar(
             position_ms=self.position,
             duration_ms=track.length,
-            length=16,
+            length=14,
             is_paused=self.paused,
         )
 
         embed.description = (
-            f"**Artis / Kreator:** `{track.author}`\n\n"
+            f"👤 **Artis / Kreator:** `{track.author}`\n"
+            f"📡 **Platform:** `{meta['name']}`\n\n"
+            f"**Progress Pemutaran:**\n"
             f"{progress_str}\n"
         )
 
@@ -125,15 +128,19 @@ class MusicPlayer(wavelink.Player):
         embed.add_field(name="🔁 Loop", value=f"`{loop_display}`", inline=True)
         embed.add_field(name="📻 Autoplay", value=f"`{autoplay_display}`", inline=True)
         embed.add_field(name="📑 Antrean", value=f"`{len(self.queue)} Lagu`", inline=True)
-        embed.add_field(name="📡 Sumber", value=f"`{meta['name']}`", inline=True)
 
-        embed.set_image(url="attachment://cover.png")
+        # Minimalist cover thumbnail on top-right:
+        if track.artwork:
+            embed.set_thumbnail(url=track.artwork)
+        else:
+            embed.set_thumbnail(url="attachment://cover.png")
+
         embed.set_footer(text="Enterprise Music • Kualitas Suara Hi-Fi")
         return embed
 
     async def send_now_playing_card(self) -> None:
         """
-        Renders and sends the high-resolution pure album cover artwork and modern Embed.
+        Renders and sends the Now-Playing card with minimalist thumbnail and interactive controls.
         """
         if not self.current or not self.text_channel:
             return
@@ -143,23 +150,21 @@ class MusicPlayer(wavelink.Player):
             self._progress_task.cancel()
 
         track = self.current
-        session = await self._get_http_session()
-
-        # Download cover art with bounded stream (max 5MB)
-        if track.artwork:
-            self._cover_cache = await download_cover_art_bounded(track.artwork, session)
-        else:
-            self._cover_cache = None
-
         cover_buffer: io.BytesIO | None = None
-        try:
-            cover_buffer = await render_now_playing_card(
-                cover_bytes=self._cover_cache,
-            )
+        file: discord.File | None = None
 
-            file = discord.File(fp=cover_buffer, filename="cover.png")
+        # Download or generate fallback cover only if track has no artwork
+        if not track.artwork:
+            try:
+                cover_buffer = await render_now_playing_card(cover_bytes=None)
+                file = discord.File(fp=cover_buffer, filename="cover.png")
+            except Exception as e:
+                LOGGER.debug("Failed to render fallback cover: %s", e)
+
+        try:
             embed = self.build_now_playing_embed()
             view = NowPlayingView(self)
+            self.now_playing_view = view
 
             # Cleanly remove old now playing message if present to avoid chat clutter
             if self.now_playing_message:
@@ -168,35 +173,45 @@ class MusicPlayer(wavelink.Player):
                 except Exception:
                     pass
 
-            self.now_playing_message = await self.text_channel.send(
-                embed=embed,
-                file=file,
-                view=view,
-            )
+            if file:
+                self.now_playing_message = await self.text_channel.send(
+                    embed=embed,
+                    file=file,
+                    view=view,
+                )
+            else:
+                self.now_playing_message = await self.text_channel.send(
+                    embed=embed,
+                    view=view,
+                )
         except Exception as e:
             LOGGER.error("Failed to generate or send Now-Playing card: %s", e)
         finally:
             if cover_buffer:
                 cover_buffer.close()
 
-        # Start rate-limited throttled progress updater (every 5 seconds)
+        # Start rate-limited throttled progress updater (every 5-6 seconds)
         self._progress_task = asyncio.create_task(self._progress_updater_loop())
 
     async def _progress_updater_loop(self) -> None:
         """
-        Background task updating the Now-Playing progress bar in real-time every 5 seconds.
-        Updates ONLY the Embed text - zero file uploads, zero image reloading/flicker.
+        Background task updating the Now-Playing progress bar and view in real-time every 5 seconds.
+        Updates ONLY the Embed text and View dropdown - zero file uploads, zero image reloading/flicker.
         Strictly conforms to Discord rate limits.
         """
         try:
+            interval = CONFIG.audio.progress_update_interval
             while self.playing and self.current:
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(interval)
                 if not self.playing or self.paused or not self.now_playing_message:
                     continue
 
                 try:
                     embed = self.build_now_playing_embed()
-                    await self.now_playing_message.edit(embed=embed)
+                    view = self.now_playing_view
+                    if view:
+                        view.sync_view_states()
+                    await self.now_playing_message.edit(embed=embed, view=view)
                 except discord.NotFound:
                     # Message was deleted by user or moderator
                     LOGGER.debug("Now playing message was deleted; stopping updater.")

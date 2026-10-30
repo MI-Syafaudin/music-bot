@@ -159,10 +159,12 @@ class MusicCog(commands.Cog, name="Music"):
             return
 
         await player.pause(True)
+        if hasattr(player, "now_playing_view") and player.now_playing_view:
+            player.now_playing_view.sync_view_states()
         if player.now_playing_message:
             try:
                 embed = player.build_now_playing_embed()
-                await player.now_playing_message.edit(embed=embed)
+                await player.now_playing_message.edit(embed=embed, view=getattr(player, "now_playing_view", None))
             except Exception:
                 pass
         await interaction.response.send_message("⏸️ Lagu telah dijeda.", ephemeral=True)
@@ -175,10 +177,12 @@ class MusicCog(commands.Cog, name="Music"):
             return
 
         await player.pause(False)
+        if hasattr(player, "now_playing_view") and player.now_playing_view:
+            player.now_playing_view.sync_view_states()
         if player.now_playing_message:
             try:
                 embed = player.build_now_playing_embed()
-                await player.now_playing_message.edit(embed=embed)
+                await player.now_playing_message.edit(embed=embed, view=getattr(player, "now_playing_view", None))
             except Exception:
                 pass
         await interaction.response.send_message("▶️ Pemutaran lagu dilanjutkan.", ephemeral=True)
@@ -224,9 +228,11 @@ class MusicCog(commands.Cog, name="Music"):
             target_ms = sanitize_seek_timestamp(timestamp, player.current.length)
             await player.seek(target_ms)
             formatted = format_time(target_ms)
+            if hasattr(player, "now_playing_view") and player.now_playing_view:
+                player.now_playing_view.sync_view_states()
             if player.now_playing_message:
                 embed = player.build_now_playing_embed()
-                await player.now_playing_message.edit(embed=embed)
+                await player.now_playing_message.edit(embed=embed, view=getattr(player, "now_playing_view", None))
             await interaction.response.send_message(f"⏩ Waktu lagu digeser ke `{formatted}`.", ephemeral=True)
         except SecurityValidationError as e:
             await interaction.response.send_message(f"❌ {e}", ephemeral=True)
@@ -406,3 +412,45 @@ class MusicCog(commands.Cog, name="Music"):
             notice = SponsorBlockManager.format_skipped_notice(segment)
             LOGGER.info("SponsorBlock event: %s", notice)
             # Log event only - do not send message to text channel to avoid cluttering chat
+
+    @commands.Cog.listener()
+    async def on_wavelink_track_exception(self, payload: wavelink.TrackExceptionEventPayload) -> None:
+        """Triggered when a track fails to decode or stream audio (e.g. YouTube block or format error)."""
+        player: MusicPlayer | None = payload.player  # type: ignore
+        LOGGER.error(
+            "Track exception in guild %s: %s (Track: %s)",
+            player.guild.id if player else "Unknown",
+            payload.exception,
+            payload.track.title,
+        )
+        if player and player.text_channel:
+            embed = discord.Embed(
+                title="⚠️ Gagal Memutar Output Audio",
+                description=(
+                    f"Lagu **{payload.track.title}** tidak dapat diputar:\n`{payload.exception}`\n\n"
+                    "💡 *Pastikan Lavalink menggunakan v4.2+ (protokol DAVE) dan plugin YouTube terbaru.*"
+                ),
+                color=discord.Color.red(),
+            )
+            try:
+                await player.text_channel.send(embed=embed)
+            except Exception:
+                pass
+
+        if player and not player.queue.is_empty:
+            next_track = player.queue.get()
+            await player.play(next_track)
+
+    @commands.Cog.listener()
+    async def on_wavelink_track_stuck(self, payload: wavelink.TrackStuckEventPayload) -> None:
+        """Triggered when audio packet output is stuck or unresponsive."""
+        player: MusicPlayer | None = payload.player  # type: ignore
+        LOGGER.warning(
+            "Track stuck in guild %s: %s (Threshold: %sms)",
+            player.guild.id if player else "Unknown",
+            payload.track.title,
+            payload.threshold,
+        )
+        if player and not player.queue.is_empty:
+            next_track = player.queue.get()
+            await player.play(next_track)
