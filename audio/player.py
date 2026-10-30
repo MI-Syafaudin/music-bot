@@ -15,7 +15,13 @@ import discord
 import wavelink
 
 from audio.sponsorblock import SponsorBlockManager
-from ui.card import download_cover_art_bounded, render_now_playing_card
+from config import CONFIG
+from ui.card import (
+    download_cover_art_bounded,
+    render_now_playing_card,
+    create_progress_bar,
+    PLATFORM_META,
+)
 from ui.views import NowPlayingView
 from utils.logging import LOGGER
 from utils.permissions import calculate_vote_quorum, get_voice_listeners
@@ -37,7 +43,7 @@ class MusicPlayer(wavelink.Player):
         self.vote_skips: set[int] = set()
         self.current_preset: str = "flat"
         self.loop_mode: str = "off"  # "off", "track", "queue"
-        self.dj_role_name: str = "DJ"
+        self.dj_role_name: str = CONFIG.audio.dj_role_name
 
         self._cover_cache: bytes | None = None
         self._progress_task: asyncio.Task | None = None
@@ -68,11 +74,66 @@ class MusicPlayer(wavelink.Player):
 
     async def setup_sponsorblock(self) -> None:
         """Configures SponsorBlock plugin filters on Lavalink node."""
-        await SponsorBlockManager.configure_player(self)
+        if CONFIG.audio.enable_sponsorblock:
+            await SponsorBlockManager.configure_player(self)
+
+    def build_now_playing_embed(self) -> discord.Embed:
+        """
+        Builds modern, sleek Discord Embed with separated real-time progress bar,
+        song title, platform badge, EQ preset, volume, loop, and queue metadata.
+        """
+        if not self.current:
+            return discord.Embed(
+                title="🎶 Tidak Ada Lagu",
+                description="Tidak ada lagu yang sedang diputar saat ini.",
+                color=discord.Color.dark_embed(),
+            )
+
+        track = self.current
+        source_key = (track.source or "").lower().replace(" ", "").replace("_", "")
+        meta = PLATFORM_META.get(source_key, PLATFORM_META["default"])
+
+        embed = discord.Embed(
+            title=f"🎵 {track.title}",
+            url=track.uri if track.uri else None,
+            color=meta["color"],
+        )
+
+        embed.set_author(
+            name=f"Sedang Memutar • {meta['name']}",
+        )
+
+        # Real-time progress bar formatted separately in description
+        progress_str = create_progress_bar(
+            position_ms=self.position,
+            duration_ms=track.length,
+            length=16,
+            is_paused=self.paused,
+        )
+
+        embed.description = (
+            f"**Artis / Kreator:** `{track.author}`\n\n"
+            f"{progress_str}\n"
+        )
+
+        loop_labels = {"off": "Mati", "track": "Lagu 🔂", "queue": "Antrean 🔁"}
+        loop_display = loop_labels.get(self.loop_mode, self.loop_mode.title())
+        autoplay_display = "Aktif 📻" if self.autoplay == wavelink.AutoPlayMode.enabled else "Mati"
+
+        embed.add_field(name="🎛️ Equalizer", value=f"`{self.current_preset.title()}`", inline=True)
+        embed.add_field(name="🔊 Volume", value=f"`{self.volume}%`", inline=True)
+        embed.add_field(name="🔁 Loop", value=f"`{loop_display}`", inline=True)
+        embed.add_field(name="📻 Autoplay", value=f"`{autoplay_display}`", inline=True)
+        embed.add_field(name="📑 Antrean", value=f"`{len(self.queue)} Lagu`", inline=True)
+        embed.add_field(name="📡 Sumber", value=f"`{meta['name']}`", inline=True)
+
+        embed.set_image(url="attachment://cover.png")
+        embed.set_footer(text="Enterprise Music • Kualitas Suara Hi-Fi")
+        return embed
 
     async def send_now_playing_card(self) -> None:
         """
-        Renders and sends the high-resolution dynamic Now-Playing visual card in-memory.
+        Renders and sends the high-resolution pure album cover artwork and modern Embed.
         """
         if not self.current or not self.text_channel:
             return
@@ -90,25 +151,23 @@ class MusicPlayer(wavelink.Player):
         else:
             self._cover_cache = None
 
-        card_buffer: io.BytesIO | None = None
+        cover_buffer: io.BytesIO | None = None
         try:
-            card_buffer = await render_now_playing_card(
-                title=track.title,
-                author=track.author,
-                position_ms=self.position,
-                duration_ms=track.length,
+            cover_buffer = await render_now_playing_card(
                 cover_bytes=self._cover_cache,
-                platform_name=track.source or "Music",
-                preset_name=self.current_preset,
-                volume=self.volume,
-                autoplay=(self.autoplay == wavelink.AutoPlayMode.enabled),
             )
 
-            file = discord.File(fp=card_buffer, filename="now_playing.png")
-            embed = discord.Embed(color=discord.Color.from_rgb(20, 24, 38))
-            embed.set_image(url="attachment://now_playing.png")
-
+            file = discord.File(fp=cover_buffer, filename="cover.png")
+            embed = self.build_now_playing_embed()
             view = NowPlayingView(self)
+
+            # Cleanly remove old now playing message if present to avoid chat clutter
+            if self.now_playing_message:
+                try:
+                    await self.now_playing_message.delete()
+                except Exception:
+                    pass
+
             self.now_playing_message = await self.text_channel.send(
                 embed=embed,
                 file=file,
@@ -117,57 +176,35 @@ class MusicPlayer(wavelink.Player):
         except Exception as e:
             LOGGER.error("Failed to generate or send Now-Playing card: %s", e)
         finally:
-            if card_buffer:
-                card_buffer.close()
+            if cover_buffer:
+                cover_buffer.close()
 
-        # Start rate-limited throttled progress updater (every 6 seconds)
+        # Start rate-limited throttled progress updater (every 5 seconds)
         self._progress_task = asyncio.create_task(self._progress_updater_loop())
 
     async def _progress_updater_loop(self) -> None:
         """
-        Background task updating the Now-Playing card progress bar every 6 seconds.
-        Ensures strict compliance with Discord rate limits (5/5s).
+        Background task updating the Now-Playing progress bar in real-time every 5 seconds.
+        Updates ONLY the Embed text - zero file uploads, zero image reloading/flicker.
+        Strictly conforms to Discord rate limits.
         """
         try:
             while self.playing and self.current:
-                await asyncio.sleep(6.0)
+                await asyncio.sleep(5.0)
                 if not self.playing or self.paused or not self.now_playing_message:
                     continue
 
-                card_buffer: io.BytesIO | None = None
                 try:
-                    card_buffer = await render_now_playing_card(
-                        title=self.current.title,
-                        author=self.current.author,
-                        position_ms=self.position,
-                        duration_ms=self.current.length,
-                        cover_bytes=self._cover_cache,
-                        platform_name=self.current.source or "Music",
-                        preset_name=self.current_preset,
-                        volume=self.volume,
-                        autoplay=(self.autoplay == wavelink.AutoPlayMode.enabled),
-                    )
-
-                    file = discord.File(fp=card_buffer, filename="now_playing.png")
-                    embed = discord.Embed(color=discord.Color.from_rgb(20, 24, 38))
-                    embed.set_image(url="attachment://now_playing.png")
-
-                    await self.now_playing_message.edit(
-                        embed=embed,
-                        attachments=[file],
-                    )
+                    embed = self.build_now_playing_embed()
+                    await self.now_playing_message.edit(embed=embed)
                 except discord.NotFound:
                     # Message was deleted by user or moderator
                     LOGGER.debug("Now playing message was deleted; stopping updater.")
                     break
                 except discord.HTTPException as e:
-                    LOGGER.debug("Discord HTTP exception during card update: %s", e)
+                    LOGGER.debug("Discord HTTP exception during progress update: %s", e)
                 except Exception as e:
-                    LOGGER.warning("Unexpected error during card progress update: %s", e)
-                finally:
-                    if card_buffer:
-                        card_buffer.close()
-
+                    LOGGER.warning("Unexpected error during progress update: %s", e)
         except asyncio.CancelledError:
             pass
 

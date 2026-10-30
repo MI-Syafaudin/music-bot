@@ -1,3 +1,14 @@
+# ==============================================================================
+# Enterprise Lavalink v4 Configuration
+#
+# PENTING / CRITICAL NOTE TENTANG OUTPUT SUARA:
+# 1. Discord sekarang mewajibkan enkripsi suara end-to-end (protokol DAVE).
+#    Gunakan Lavalink Server versi v4.2.0 atau lebih baru! Versi lama (< v4.2.0)
+#    akan menyebabkan "output suara tidak ada" karena Discord menolak paket audio unencrypted.
+# 2. Gunakan dev.lavalink.youtube:youtube-plugin:1.18.2 (atau terbaru) dengan konfigurasi
+#    plugins.youtube aktif agar pemutaran YouTube & LavaSrc (Spotify/Apple Music) berjalan normal.
+# ==============================================================================
+
 server:
   port: 2333
   address: 0.0.0.0
@@ -15,14 +26,15 @@ lavalink:
     # SponsorBlock Plugin for Auto-Skipping Non-Music Segments
     - dependency: "com.github.topi314.sponsorblock:sponsorblock-plugin:3.0.1"
       repository: "https://maven.lavalink.dev/releases"
-    # YouTube Source Plugin
-    - dependency: "dev.arbjerg.lavalink.libraries.youtube:youtube-plugin:1.11.4"
+    # Official YouTube Source Plugin (v4.2.0+ compatible)
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"
       repository: "https://maven.lavalink.dev/releases"
+      snapshot: false
 
   server:
     password: "youshallnotpass"
     sources:
-      youtube: false # Handled via youtube-plugin
+      youtube: false # Dikelola melalui plugin resmi dev.lavalink.youtube
       bandcamp: true
       soundcloud: true
       twitch: true
@@ -52,12 +64,25 @@ lavalink:
     gc-warnings: true
 
 plugins:
-  # LavaSrc Plugin Configuration
+  # Konfigurasi Resmi YouTube Source Plugin
+  youtube:
+    enabled: true
+    allowSearch: true
+    allowDirectVideoIds: true
+    allowDirectPlaylistIds: true
+    clients:
+      - MUSIC
+      - ANDROID_TESTSUITE
+      - WEB
+      - TVHTML5EMBEDDED
+
+  # Konfigurasi LavaSrc Multi-Platform (Spotify, Apple Music, Deezer, Tidal)
   lavasrc:
     providers:
       - "ytsearch:\"%ISRC%\""
       - "ytmsearch:\"%ISRC%\""
       - "ytsearch:%QUERY%"
+      - "scsearch:%QUERY%" # Fallback SoundCloud
     sources:
       spotify: true
       applemusic: true
@@ -70,18 +95,18 @@ plugins:
       clientId: "YOUR_SPOTIFY_CLIENT_ID"
       clientSecret: "YOUR_SPOTIFY_CLIENT_SECRET"
       spdc: "YOUR_SPOTIFY_SPDC_COOKIE"
-      countryCode: "US"
+      countryCode: "ID"
       playlistLoadLimit: 100
       albumLoadLimit: 50
     applemusic:
-      countryCode: "US"
+      countryCode: "ID"
       mediaAPIToken: "YOUR_APPLE_MUSIC_API_TOKEN"
       playlistLoadLimit: 100
       albumLoadLimit: 50
     deezer:
       masterDecryptionKey: "YOUR_DEEZER_DECRYPTION_KEY"
     tidal:
-      countryCode: "US"
+      countryCode: "ID"
       token: "YOUR_TIDAL_TOKEN"
 
   # SponsorBlock Configuration
@@ -102,3 +127,4 @@ logging:
   level:
     root: INFO
     lavalink: INFO
+    moe.kyokobot.koe.internal.dave: INFO

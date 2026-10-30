@@ -1,6 +1,7 @@
 """
 Interactive Discord UI Views with Weak References and Safe Controls.
 Includes NowPlayingView, SeekModal, EQSelectView, and CustomEQModal.
+Eliminates spammy chat notifications on button clicks by updating messages in-place or deferring silently.
 """
 
 from __future__ import annotations
@@ -8,6 +9,7 @@ from __future__ import annotations
 import weakref
 from typing import TYPE_CHECKING, Any
 import discord
+import wavelink
 
 from audio.dsp import (
     PresetType,
@@ -16,7 +18,7 @@ from audio.dsp import (
 )
 from database.models import CustomEQPreset
 from utils.logging import LOGGER
-from utils.permissions import can_bypass_vote_skip, calculate_vote_quorum, get_voice_listeners
+from utils.permissions import can_bypass_vote_skip, calculate_vote_quorum
 from utils.security import sanitize_gain, sanitize_seek_timestamp, SecurityValidationError
 
 if TYPE_CHECKING:
@@ -42,23 +44,21 @@ class SeekModal(discord.ui.Modal, title="Seek ke Waktu Lagu"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         player = self._player_ref()
         if not player or not player.current:
-            await interaction.response.send_message("❌ Tidak ada lagu yang sedang diputar.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         time_str = self.timestamp.value.strip()
         try:
             target_ms = sanitize_seek_timestamp(time_str, player.current.length)
             await player.seek(target_ms)
-            formatted = f"{target_ms // 60000:02d}:{(target_ms % 60000) // 1000:02d}"
-            await interaction.response.send_message(
-                f"⏩ Memindahkan pemutaran ke `{formatted}`.",
-                ephemeral=True,
-            )
-        except SecurityValidationError as e:
-            await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+            if player.now_playing_message:
+                embed = player.build_now_playing_embed()
+                await player.now_playing_message.edit(embed=embed)
         except Exception as e:
-            LOGGER.error("Error seeking: %s", e)
-            await interaction.response.send_message("❌ Gagal menggeser durasi lagu.", ephemeral=True)
+            LOGGER.error("Error seeking via modal: %s", e)
+
+        # Acknowledge without sending notification text
+        await interaction.response.defer()
 
 
 class CustomEQModal(discord.ui.Modal, title="Custom Equalizer Builder"):
@@ -108,7 +108,7 @@ class CustomEQModal(discord.ui.Modal, title="Custom Equalizer Builder"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         player = self._player_ref()
         if not player:
-            await interaction.response.send_message("❌ Pemutar musik tidak ditemukan.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         try:
@@ -118,16 +118,15 @@ class CustomEQModal(discord.ui.Modal, title="Custom Equalizer Builder"):
             val_4k = sanitize_gain(float(self.g_4khz.value.strip()))
             val_14k = sanitize_gain(float(self.g_14khz.value.strip()))
         except ValueError:
-            await interaction.response.send_message("❌ Nilai gain harus berupa angka desimal.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         # Apply interpolated filters
         filters = create_filters_from_5_bands(val_60, val_230, val_910, val_4k, val_14k)
         await player.set_filters(filters)
-        player.current_preset = "custom"
+        player.current_preset = self.preset_name or "Custom"
 
-        # Save to database if bot repository is available
-        saved_msg = ""
+        # Save to database if requested and repository available
         bot: EnterpriseMusicBot = interaction.client  # type: ignore
         if self.preset_name and hasattr(bot, "repository"):
             import time
@@ -141,15 +140,19 @@ class CustomEQModal(discord.ui.Modal, title="Custom Equalizer Builder"):
                 gain_14khz=val_14k,
                 created_at=time.time(),
             )
-            await bot.repository.save_custom_preset(preset_obj)
-            saved_msg = f" dan disimpan sebagai preset `{self.preset_name}`"
+            try:
+                await bot.repository.save_custom_preset(preset_obj)
+            except Exception as e:
+                LOGGER.warning("Failed to save custom preset: %s", e)
 
-        await interaction.response.send_message(
-            f"🎛️ **Custom Equalizer Diterapkan{saved_msg}!**\n"
-            f"• 60Hz: `{val_60:+0.2f}` | 230Hz: `{val_230:+0.2f}` | 910Hz: `{val_910:+0.2f}` | "
-            f"4kHz: `{val_4k:+0.2f}` | 14kHz: `{val_14k:+0.2f}`",
-            ephemeral=True,
-        )
+        if player.now_playing_message:
+            try:
+                embed = player.build_now_playing_embed()
+                await player.now_playing_message.edit(embed=embed)
+            except Exception:
+                pass
+
+        await interaction.response.defer()
 
 
 class EQSelectView(discord.ui.View):
@@ -169,7 +172,7 @@ class EQSelectView(discord.ui.View):
             discord.SelectOption(label="Pop", value=PresetType.POP, description="Optimasi vokal dan nada cerah", emoji="🎤"),
             discord.SelectOption(label="Rock", value=PresetType.ROCK, description="Punch tebal dan treble tajam", emoji="🎸"),
             discord.SelectOption(label="Classical", value=PresetType.CLASSICAL, description="Kehangatan orkestra & akustik", emoji="🎻"),
-            discord.SelectOption(label="Electronic", value=PresetType.ELECTRONIC, description="Sub-bass dalam & synthesizers jernih", emoji="⚡"),
+            discord.SelectOption(label="Electronic", value=PresetType.ELECTRONIC, description="Sub-bass dalam & synths jernih", emoji="⚡"),
             discord.SelectOption(label="Nightcore", value=PresetType.NIGHTCORE, description="Kecepatan +15%, nada lebih tinggi", emoji="🌙"),
             discord.SelectOption(label="Vaporwave", value=PresetType.VAPORWAVE, description="Tempo santai -15%, nada retro", emoji="🌊"),
             discord.SelectOption(label="8D Audio", value=PresetType.EIGHT_D, description="Rotasi suara 360 derajat", emoji="🎧"),
@@ -179,7 +182,7 @@ class EQSelectView(discord.ui.View):
     async def select_preset(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
         player = self._player_ref()
         if not player:
-            await interaction.response.send_message("❌ Pemutar musik tidak ditemukan.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         choice = select.values[0]
@@ -187,16 +190,21 @@ class EQSelectView(discord.ui.View):
         await player.set_filters(filters)
         player.current_preset = choice
 
-        await interaction.response.send_message(
-            f"🎛️ Preset audio diubah menjadi **{choice.title()}**.",
-            ephemeral=True,
-        )
+        # Update the main player message embed in-place
+        if player.now_playing_message:
+            try:
+                embed = player.build_now_playing_embed()
+                await player.now_playing_message.edit(embed=embed)
+            except Exception:
+                pass
+
+        await interaction.response.defer()
 
     @discord.ui.button(label="Custom EQ Builder", style=discord.ButtonStyle.primary, emoji="🛠️")
     async def open_builder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self._player_ref()
         if not player:
-            await interaction.response.send_message("❌ Pemutar musik tidak ditemukan.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         await interaction.response.send_modal(CustomEQModal(player))
@@ -206,15 +214,43 @@ class NowPlayingView(discord.ui.View):
     """
     Main interactive control view for currently playing track.
     Implements weakref to Player to guarantee zero circular reference memory leaks.
+    Updates controls in-place and eliminates chat-cluttering notification popups.
     """
 
     def __init__(self, player: MusicPlayer) -> None:
         super().__init__(timeout=None)
         self._player_ref = weakref.ref(player)
+        self._sync_button_states()
 
     @property
     def player(self) -> MusicPlayer | None:
         return self._player_ref()
+
+    def _sync_button_states(self) -> None:
+        """Synchronizes button labels, styles, and emojis to player state."""
+        player = self.player
+        if not player:
+            return
+
+        # Play/Pause button state
+        self.btn_play_pause.emoji = "▶️" if player.paused else "⏸️"
+        self.btn_play_pause.style = (
+            discord.ButtonStyle.secondary if player.paused else discord.ButtonStyle.primary
+        )
+
+        # Loop button state
+        loop_labels = {"off": "Loop: Off", "track": "Loop: Track", "queue": "Loop: Queue"}
+        self.btn_loop.label = loop_labels.get(player.loop_mode, "Loop: Off")
+        self.btn_loop.style = (
+            discord.ButtonStyle.success if player.loop_mode != "off" else discord.ButtonStyle.secondary
+        )
+
+        # Autoplay button state
+        is_auto = player.autoplay == wavelink.AutoPlayMode.enabled
+        self.btn_autoplay.label = f"Autoplay: {'On' if is_auto else 'Off'}"
+        self.btn_autoplay.style = (
+            discord.ButtonStyle.success if is_auto else discord.ButtonStyle.secondary
+        )
 
     # ---------------- Row 0: Basic Controls ----------------
 
@@ -222,33 +258,33 @@ class NowPlayingView(discord.ui.View):
     async def btn_previous(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player:
-            await interaction.response.send_message("❌ Pemutar musik tidak aktif.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         if not player.queue.history.is_empty:
             prev_track = player.queue.history.peek()
             player.queue.put_at(0, prev_track)
             await player.skip()
-            await interaction.response.send_message("⏮️ Memutar lagu sebelumnya.", ephemeral=True)
-        else:
-            await interaction.response.send_message("ℹ️ Tidak ada riwayat lagu sebelumnya.", ephemeral=True)
+
+        await interaction.response.defer()
 
     @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.primary, row=0)
     async def btn_play_pause(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
-        if not player:
-            await interaction.response.send_message("❌ Pemutar musik tidak aktif.", ephemeral=True)
+        if not player or not player.current:
+            await interaction.response.defer()
             return
 
         await player.pause(not player.paused)
-        state_text = "dijeda (paused)" if player.paused else "dilanjutkan (resumed)"
-        await interaction.response.send_message(f"⏯️ Lagu **{state_text}**.", ephemeral=True)
+        self._sync_button_states()
+        embed = player.build_now_playing_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
     async def btn_skip(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player or not player.current or not interaction.guild:
-            await interaction.response.send_message("❌ Tidak ada lagu yang sedang diputar.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         member = interaction.user
@@ -258,53 +294,49 @@ class NowPlayingView(discord.ui.View):
         vc = player.channel
         if not vc:
             await player.skip()
-            await interaction.response.send_message("⏭️ Lagu dilewati.", ephemeral=True)
+            await interaction.response.defer()
             return
 
-        # Check bypass permission
+        # Check bypass permission or vote skip
         if can_bypass_vote_skip(member, vc, player.dj_role_name):
             await player.skip()
-            await interaction.response.send_message("⏭️ Lagu dilewati (Bypass DJ/Admin/Solo).", ephemeral=False)
-            return
-
-        # Vote skip
-        quorum_reached, current_votes, quorum = player.add_vote_skip(member.id)
-        if quorum_reached:
-            await player.skip()
-            await interaction.response.send_message(
-                f"⏭️ Kuorum tercapai ({current_votes}/{quorum} suara)! Lagu dilewati.",
-                ephemeral=False,
-            )
         else:
-            await interaction.response.send_message(
-                f"🗳️ Suara skip dicatat! ({current_votes}/{quorum} suara diperlukan).",
-                ephemeral=False,
-            )
+            quorum_reached, _, _ = player.add_vote_skip(member.id)
+            if quorum_reached:
+                await player.skip()
+
+        await interaction.response.defer()
 
     @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
     async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player:
-            await interaction.response.send_message("❌ Pemutar musik tidak aktif.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         player.queue.clear()
-        await player.disconnect()
-        await interaction.response.send_message("⏹️ Pemutaran dihentikan dan bot keluar.", ephemeral=True)
+        await player.destroy()
+
+        embed = discord.Embed(
+            title="⏹️ Pemutaran Dihentikan",
+            description="Pemutar musik telah dimatikan dan antrean dibersihkan.",
+            color=discord.Color.dark_embed(),
+        )
+        try:
+            await interaction.response.edit_message(embed=embed, view=None)
+        except Exception:
+            await interaction.response.defer()
 
     @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, row=0)
     async def btn_shuffle(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
-        if not player:
-            await interaction.response.send_message("❌ Pemutar musik tidak aktif.", ephemeral=True)
-            return
-
-        if player.queue.is_empty:
-            await interaction.response.send_message("ℹ️ Antrean masih kosong.", ephemeral=True)
+        if not player or player.queue.is_empty:
+            await interaction.response.defer()
             return
 
         player.queue.shuffle()
-        await interaction.response.send_message("🔀 Antrean lagu berhasil diacak.", ephemeral=True)
+        embed = player.build_now_playing_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
 
     # ---------------- Row 1: Seek & Audio Controls ----------------
 
@@ -312,29 +344,31 @@ class NowPlayingView(discord.ui.View):
     async def btn_rewind(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player or not player.current:
-            await interaction.response.send_message("❌ Tidak ada lagu yang sedang diputar.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         new_pos = max(0, player.position - 15000)
         await player.seek(new_pos)
-        await interaction.response.send_message("⏪ Mundur 15 detik.", ephemeral=True)
+        embed = player.build_now_playing_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="+15s", emoji="⏩", style=discord.ButtonStyle.secondary, row=1)
     async def btn_forward(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player or not player.current:
-            await interaction.response.send_message("❌ Tidak ada lagu yang sedang diputar.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         new_pos = min(player.current.length, player.position + 15000)
         await player.seek(new_pos)
-        await interaction.response.send_message("⏩ Maju 15 detik.", ephemeral=True)
+        embed = player.build_now_playing_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="Seek", emoji="🎯", style=discord.ButtonStyle.secondary, row=1)
     async def btn_seek_modal(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player or not player.current:
-            await interaction.response.send_message("❌ Tidak ada lagu yang sedang diputar.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         await interaction.response.send_modal(SeekModal(player))
@@ -343,7 +377,7 @@ class NowPlayingView(discord.ui.View):
     async def btn_equalizer(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player:
-            await interaction.response.send_message("❌ Pemutar musik tidak aktif.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         await interaction.response.send_message(
@@ -356,7 +390,7 @@ class NowPlayingView(discord.ui.View):
     async def btn_lyrics(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player or not player.current:
-            await interaction.response.send_message("❌ Tidak ada lagu yang sedang diputar.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         from ui.lyrics_view import SyncedLyricsView
@@ -370,30 +404,29 @@ class NowPlayingView(discord.ui.View):
     async def btn_loop(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player:
-            await interaction.response.send_message("❌ Pemutar musik tidak aktif.", ephemeral=True)
+            await interaction.response.defer()
             return
 
         modes = ["off", "track", "queue"]
         next_mode = modes[(modes.index(player.loop_mode) + 1) % len(modes)]
         player.loop_mode = next_mode
-        button.label = f"Loop: {next_mode.title()}"
-        await interaction.response.edit_message(view=self)
+        self._sync_button_states()
+        embed = player.build_now_playing_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="Autoplay: Off", emoji="📻", style=discord.ButtonStyle.secondary, row=2)
     async def btn_autoplay(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self.player
         if not player:
-            await interaction.response.send_message("❌ Pemutar musik tidak aktif.", ephemeral=True)
+            await interaction.response.defer()
             return
 
-        import wavelink
         new_state = (
             wavelink.AutoPlayMode.disabled
             if player.autoplay == wavelink.AutoPlayMode.enabled
             else wavelink.AutoPlayMode.enabled
         )
         player.autoplay = new_state
-        is_on = new_state == wavelink.AutoPlayMode.enabled
-        button.label = f"Autoplay: {'On' if is_on else 'Off'}"
-        button.style = discord.ButtonStyle.success if is_on else discord.ButtonStyle.secondary
-        await interaction.response.edit_message(view=self)
+        self._sync_button_states()
+        embed = player.build_now_playing_embed()
+        await interaction.response.edit_message(embed=embed, view=self)

@@ -33,10 +33,8 @@ class EnterpriseMusicBot(commands.AutoShardedBot):
     def __init__(self, config: BotConfig) -> None:
         self.config = config
 
-        # Strict minimal intents for music bot operations
-        intents = discord.Intents.none()
-        intents.guilds = True
-        intents.voice_states = True
+        # Standard default intents (guilds, voice_states, etc.) without privileged requirements
+        intents = discord.Intents.default()
 
         super().__init__(
             command_prefix="!",

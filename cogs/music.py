@@ -1,10 +1,10 @@
 """
 Music Cog: Primary slash commands for playback, queue management, volume, and autoplay.
+Provides modern, sleek Discord Embed UI and reliable audio connectivity with self-deafen.
 """
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 import discord
 from discord import app_commands
@@ -14,8 +14,10 @@ import wavelink
 from audio.player import MusicPlayer
 from audio.resolver import AudioResolver
 from audio.sponsorblock import SponsorBlockManager
+from config import CONFIG
+from ui.card import PLATFORM_META, create_progress_bar, format_time
 from utils.logging import LOGGER
-from utils.permissions import can_bypass_vote_skip, calculate_vote_quorum
+from utils.permissions import can_bypass_vote_skip
 from utils.security import sanitize_seek_timestamp, SecurityValidationError
 
 if TYPE_CHECKING:
@@ -33,7 +35,7 @@ class MusicCog(commands.Cog, name="Music"):
     async def _ensure_voice(
         self, interaction: discord.Interaction
     ) -> tuple[MusicPlayer | None, str | None]:
-        """Validates that user is connected to a voice channel and retrieves/connects the player."""
+        """Validates that user is connected to a voice channel and retrieves/connects the player with self-deaf."""
         if not interaction.guild:
             return None, "❌ Perintah ini hanya dapat dijalankan di dalam server (guild)."
 
@@ -45,9 +47,13 @@ class MusicCog(commands.Cog, name="Music"):
         player: MusicPlayer | None = getattr(interaction.guild, "voice_client", None)  # type: ignore
 
         if player is None:
-            # Connect player
-            player = await voice_channel.connect(cls=MusicPlayer)  # type: ignore
+            # Connect player with self_deaf=True to ensure reliable audio output and avoid packet drops
+            player = await voice_channel.connect(cls=MusicPlayer, self_deaf=True)  # type: ignore
             player.text_channel = interaction.channel  # type: ignore
+            try:
+                await player.set_volume(CONFIG.audio.default_volume)
+            except Exception as e:
+                LOGGER.debug("Error setting initial volume: %s", e)
         elif player.channel.id != voice_channel.id:
             # Check if bot is playing alone
             listeners = [m for m in player.channel.members if not m.bot]
@@ -99,34 +105,50 @@ class MusicCog(commands.Cog, name="Music"):
             embed = discord.Embed(
                 title="📑 Playlist Ditambahkan ke Antrean",
                 description=(
-                    f"• **Nama Playlist:** `{results.name}`\n"
+                    f"### `{results.name}`\n"
                     f"• **Jumlah Lagu:** `{len(results.tracks)} lagu`\n"
                     f"• **Pemohon:** {interaction.user.mention}"
                 ),
                 color=discord.Color.brand_green(),
             )
+            embed.set_footer(text="Enterprise Music • Playlist Terdaftar")
             await interaction.followup.send(embed=embed)
         else:
             # Single or list of tracks
             track: wavelink.Playable = results[0]
             if not player.playing:
                 await player.play(track)
-                await interaction.followup.send(f"▶️ Memulai pemutaran: **{track.title}**")
+                # When player starts playing, on_wavelink_track_start will send the rich visual Now Playing card
+                source_key = (track.source or "").lower().replace(" ", "").replace("_", "")
+                meta = PLATFORM_META.get(source_key, PLATFORM_META["default"])
+                embed = discord.Embed(
+                    title=f"▶️ Memulai Pemutaran",
+                    description=f"[{track.title}]({track.uri or 'https://discord.com'})\n**Artis:** `{track.author}`",
+                    color=meta["color"],
+                )
+                if track.artwork:
+                    embed.set_thumbnail(url=track.artwork)
+                await interaction.followup.send(embed=embed)
             else:
                 player.queue.put(track)
-                duration_sec = track.length // 1000
-                mins, secs = duration_sec // 60, duration_sec % 60
+                duration_str = format_time(track.length)
+                source_key = (track.source or "").lower().replace(" ", "").replace("_", "")
+                meta = PLATFORM_META.get(source_key, PLATFORM_META["default"])
+
                 embed = discord.Embed(
-                    title="🎵 Lagu Ditambahkan ke Antrean",
+                    title="🎶 Lagu Ditambahkan ke Antrean",
                     description=(
-                        f"• **Judul:** `{track.title}`\n"
+                        f"### [{track.title}]({track.uri or 'https://discord.com'})\n"
                         f"• **Artis:** `{track.author}`\n"
-                        f"• **Durasi:** `{mins:02d}:{secs:02d}`\n"
+                        f"• **Durasi:** `{duration_str}`\n"
                         f"• **Posisi Antrean:** `#{len(player.queue)}`\n"
                         f"• **Pemohon:** {interaction.user.mention}"
                     ),
-                    color=discord.Color.blue(),
+                    color=meta["color"],
                 )
+                if track.artwork:
+                    embed.set_thumbnail(url=track.artwork)
+                embed.set_footer(text=f"Platform: {meta['name']}")
                 await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="pause", description="Jeda (pause) pemutaran audio saat ini.")
@@ -137,7 +159,13 @@ class MusicCog(commands.Cog, name="Music"):
             return
 
         await player.pause(True)
-        await interaction.response.send_message("⏸️ Lagu telah dijeda.")
+        if player.now_playing_message:
+            try:
+                embed = player.build_now_playing_embed()
+                await player.now_playing_message.edit(embed=embed)
+            except Exception:
+                pass
+        await interaction.response.send_message("⏸️ Lagu telah dijeda.", ephemeral=True)
 
     @app_commands.command(name="resume", description="Lanjutkan pemutaran audio yang sedang dijeda.")
     async def resume(self, interaction: discord.Interaction) -> None:
@@ -147,9 +175,15 @@ class MusicCog(commands.Cog, name="Music"):
             return
 
         await player.pause(False)
-        await interaction.response.send_message("▶️ Pemutaran lagu dilanjutkan.")
+        if player.now_playing_message:
+            try:
+                embed = player.build_now_playing_embed()
+                await player.now_playing_message.edit(embed=embed)
+            except Exception:
+                pass
+        await interaction.response.send_message("▶️ Pemutaran lagu dilanjutkan.", ephemeral=True)
 
-    @app_commands.command(name="skip", description="Lewati lagu saat ini (Vote-Skip jika bukan DJ).")
+    @app_commands.command(name="skip", description="Lewati lagu saat ini.")
     async def skip(self, interaction: discord.Interaction) -> None:
         player: MusicPlayer | None = getattr(interaction.guild, "voice_client", None)  # type: ignore
         if not player or not player.current or not interaction.guild:
@@ -163,21 +197,20 @@ class MusicCog(commands.Cog, name="Music"):
         vc = player.channel
         if not vc:
             await player.skip()
-            await interaction.response.send_message("⏭️ Lagu dilewati.")
+            await interaction.response.send_message("⏭️ Lagu dilewati.", ephemeral=True)
             return
 
-        # Check bypass permission
         if can_bypass_vote_skip(member, vc, player.dj_role_name):
             await player.skip()
-            await interaction.response.send_message("⏭️ Lagu dilewati (Bypass DJ/Admin/Solo).")
+            await interaction.response.send_message("⏭️ Lagu dilewati.", ephemeral=True)
             return
 
         quorum_reached, current_votes, quorum = player.add_vote_skip(member.id)
         if quorum_reached:
             await player.skip()
-            await interaction.response.send_message(f"⏭️ Kuorum tercapai ({current_votes}/{quorum} suara)! Lagu dilewati.")
+            await interaction.response.send_message(f"⏭️ Kuorum tercapai ({current_votes}/{quorum} suara)! Lagu dilewati.", ephemeral=True)
         else:
-            await interaction.response.send_message(f"🗳️ Suara skip dicatat! ({current_votes}/{quorum} suara diperlukan).")
+            await interaction.response.send_message(f"🗳️ Suara skip dicatat! ({current_votes}/{quorum} suara diperlukan).", ephemeral=True)
 
     @app_commands.command(name="seek", description="Pindah ke menit/detik tertentu pada lagu (MM:SS).")
     @app_commands.describe(timestamp="Format MM:SS atau HH:MM:SS (contoh: 02:30)")
@@ -190,8 +223,11 @@ class MusicCog(commands.Cog, name="Music"):
         try:
             target_ms = sanitize_seek_timestamp(timestamp, player.current.length)
             await player.seek(target_ms)
-            formatted = f"{target_ms // 60000:02d}:{(target_ms % 60000) // 1000:02d}"
-            await interaction.response.send_message(f"⏩ Waktu lagu digeser ke `{formatted}`.")
+            formatted = format_time(target_ms)
+            if player.now_playing_message:
+                embed = player.build_now_playing_embed()
+                await player.now_playing_message.edit(embed=embed)
+            await interaction.response.send_message(f"⏩ Waktu lagu digeser ke `{formatted}`.", ephemeral=True)
         except SecurityValidationError as e:
             await interaction.response.send_message(f"❌ {e}", ephemeral=True)
 
@@ -204,7 +240,7 @@ class MusicCog(commands.Cog, name="Music"):
 
         player.queue.clear()
         await player.destroy()
-        await interaction.response.send_message("⏹️ Pemutaran dihentikan dan antrean dibersihkan.")
+        await interaction.response.send_message("⏹️ Pemutaran dihentikan dan antrean dibersihkan.", ephemeral=True)
 
     @app_commands.command(name="queue", description="Lihat daftar antrean lagu saat ini.")
     async def queue(self, interaction: discord.Interaction) -> None:
@@ -214,25 +250,40 @@ class MusicCog(commands.Cog, name="Music"):
             return
 
         curr = player.current
-        curr_mins, curr_secs = (curr.length // 1000) // 60, (curr.length // 1000) % 60
+        bar = create_progress_bar(player.position, curr.length, length=12, is_paused=player.paused)
+
         embed = discord.Embed(
-            title="🎶 Antrean Lagu",
-            description=f"▶️ **Sedang Diputar:** `{curr.title}` ({curr_mins:02d}:{curr_secs:02d})",
+            title="🎶 Antrean Lagu Server",
+            description=(
+                f"**Sedang Diputar:**\n"
+                f"[{curr.title}]({curr.uri or 'https://discord.com'})\n"
+                f"👤 `{curr.author}`\n"
+                f"{bar}\n"
+            ),
             color=discord.Color.blurple(),
         )
 
         if player.queue.is_empty:
-            embed.add_field(name="Antrean Berikutnya", value="*Tidak ada lagu berikutnya dalam antrean.*", inline=False)
+            embed.add_field(
+                name="Antrean Berikutnya",
+                value="*Tidak ada lagu berikutnya dalam antrean. Gunakan `/play` untuk menambah lagu.*",
+                inline=False,
+            )
         else:
             queue_list = []
             for idx, track in enumerate(list(player.queue)[:10], start=1):
-                t_sec = track.length // 1000
-                queue_list.append(f"`{idx}.` **{track.title}** ({t_sec // 60:02d}:{t_sec % 60:02d}) - {track.author}")
+                t_str = format_time(track.length)
+                queue_list.append(f"`{idx:02d}.` **[{track.title}]({track.uri or 'https://discord.com'})** (`{t_str}`) - `{track.author}`")
             remaining = len(player.queue) - 10
             if remaining > 0:
                 queue_list.append(f"*...dan {remaining} lagu lainnya.*")
-            embed.add_field(name=f"Antrean ({len(player.queue)} lagu)", value="\n".join(queue_list), inline=False)
+            embed.add_field(
+                name=f"Daftar Antrean ({len(player.queue)} lagu)",
+                value="\n".join(queue_list),
+                inline=False,
+            )
 
+        embed.set_footer(text=f"Volume: {player.volume}% • Mode Loop: {player.loop_mode.title()}")
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="nowplaying", description="Tampilkan kartu visual Now-Playing lagu saat ini.")
@@ -242,7 +293,7 @@ class MusicCog(commands.Cog, name="Music"):
             await interaction.response.send_message("❌ Tidak ada lagu yang sedang diputar.", ephemeral=True)
             return
 
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
         player.text_channel = interaction.channel  # type: ignore
         await player.send_now_playing_card()
         await interaction.followup.send("🎶 Kartu visual Now-Playing diperbarui.", ephemeral=True)
@@ -256,10 +307,17 @@ class MusicCog(commands.Cog, name="Music"):
 
         if player.autoplay == wavelink.AutoPlayMode.enabled:
             player.autoplay = wavelink.AutoPlayMode.disabled
-            await interaction.response.send_message("📻 **Smart Autoplay dimatikan.**")
+            await interaction.response.send_message("📻 **Smart Autoplay dimatikan.**", ephemeral=True)
         else:
             player.autoplay = wavelink.AutoPlayMode.enabled
-            await interaction.response.send_message("📻 **Smart Autoplay diaktifkan!** Rekomendasi lagu sejenis akan diputar otomatis.")
+            await interaction.response.send_message("📻 **Smart Autoplay diaktifkan!** Rekomendasi lagu sejenis akan diputar otomatis.", ephemeral=True)
+
+        if player.now_playing_message:
+            try:
+                embed = player.build_now_playing_embed()
+                await player.now_playing_message.edit(embed=embed)
+            except Exception:
+                pass
 
     @app_commands.command(name="volume", description="Atur tingkat volume pemutar audio (0 - 150%).")
     @app_commands.describe(level="Persentase volume (0 - 150)")
@@ -271,7 +329,13 @@ class MusicCog(commands.Cog, name="Music"):
 
         clamped = max(0, min(150, level))
         await player.set_volume(clamped)
-        await interaction.response.send_message(f"🔊 Volume diatur ke `{clamped}%`.")
+        if player.now_playing_message:
+            try:
+                embed = player.build_now_playing_embed()
+                await player.now_playing_message.edit(embed=embed)
+            except Exception:
+                pass
+        await interaction.response.send_message(f"🔊 Volume diatur ke `{clamped}%`.", ephemeral=True)
 
     @app_commands.command(name="shuffle", description="Acak urutan antrean lagu.")
     async def shuffle(self, interaction: discord.Interaction) -> None:
@@ -281,7 +345,13 @@ class MusicCog(commands.Cog, name="Music"):
             return
 
         player.queue.shuffle()
-        await interaction.response.send_message("🔀 Antrean lagu berhasil diacak.")
+        if player.now_playing_message:
+            try:
+                embed = player.build_now_playing_embed()
+                await player.now_playing_message.edit(embed=embed)
+            except Exception:
+                pass
+        await interaction.response.send_message("🔀 Antrean lagu berhasil diacak.", ephemeral=True)
 
     # ---------------- Wavelink Event Listeners ----------------
 
@@ -295,7 +365,7 @@ class MusicCog(commands.Cog, name="Music"):
         player.reset_vote_skips()
         LOGGER.info("Track started in guild %s: %s", player.guild.id, payload.track.title)
 
-        # Trigger in-memory Pillow Now Playing Card
+        # Trigger pure album cover card and modern Embed
         await player.send_now_playing_card()
 
     @commands.Cog.listener()
@@ -316,20 +386,23 @@ class MusicCog(commands.Cog, name="Music"):
 
         # If queue is empty and autoplay is off, player will be idle
         if player.queue.is_empty and player.autoplay == wavelink.AutoPlayMode.disabled:
-            if player.text_channel:
-                await player.text_channel.send("⏹️ Antrean lagu telah selesai diputar.")
+            if player.now_playing_message:
+                try:
+                    embed = discord.Embed(
+                        title="⏹️ Antrean Selesai",
+                        description="Semua lagu dalam antrean telah selesai diputar.",
+                        color=discord.Color.dark_embed(),
+                    )
+                    await player.now_playing_message.edit(embed=embed, view=None)
+                except Exception:
+                    pass
 
     @commands.Cog.listener()
     async def on_wavelink_extra_event(self, payload: wavelink.ExtraEventPayload) -> None:
-        """Handles SponsorBlock SegmentSkipped events natively."""
+        """Handles SponsorBlock SegmentSkipped events natively without chat spam."""
         event_type = payload.data.get("type")
         if event_type == "SegmentSkipped":
             segment = payload.data.get("segment", {})
             notice = SponsorBlockManager.format_skipped_notice(segment)
             LOGGER.info("SponsorBlock event: %s", notice)
-            player: MusicPlayer | None = payload.player  # type: ignore
-            if player and player.text_channel:
-                try:
-                    await player.text_channel.send(notice)
-                except Exception:
-                    pass
+            # Log event only - do not send message to text channel to avoid cluttering chat

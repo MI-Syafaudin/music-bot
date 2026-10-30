@@ -4,7 +4,13 @@ Now-Playing Card Rendering and Memory-Safety Unit Tests.
 
 import io
 import pytest
-from ui.card import _render_card_sync, download_cover_art_bounded, MAX_IMAGE_BYTES
+from ui.card import (
+    _render_card_sync,
+    download_cover_art_bounded,
+    create_progress_bar,
+    format_time,
+    MAX_IMAGE_BYTES,
+)
 
 
 def test_card_rendering_without_cover() -> None:
@@ -54,3 +60,30 @@ def test_card_rendering_with_synthetic_cover() -> None:
     assert len(content) > 1000
     assert content.startswith(b"\x89PNG\r\n\x1a\n")
     buf.close()
+
+
+def test_create_progress_bar() -> None:
+    # Mid-track playing
+    bar_playing = create_progress_bar(position_ms=60000, duration_ms=180000, length=16, is_paused=False)
+    assert "▶️" in bar_playing
+    assert "`01:00`" in bar_playing
+    assert "`03:00`" in bar_playing
+    assert "🔘" in bar_playing
+
+    # Paused state
+    bar_paused = create_progress_bar(position_ms=90000, duration_ms=180000, length=16, is_paused=True)
+    assert "⏸️" in bar_paused
+
+    # Zero duration safety
+    bar_zero = create_progress_bar(position_ms=0, duration_ms=0, length=16, is_paused=False)
+    assert "`00:00`" in bar_zero
+
+    # Overflow position safety
+    bar_over = create_progress_bar(position_ms=200000, duration_ms=180000, length=16, is_paused=False)
+    assert "🔘" in bar_over
+
+
+def test_format_time() -> None:
+    assert format_time(0) == "00:00"
+    assert format_time(65000) == "01:05"
+    assert format_time(3665000) == "1:01:05"
